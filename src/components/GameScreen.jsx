@@ -168,20 +168,40 @@ export default function GameScreen({ room, player }) {
     if (!player.is_host) return
     const newDeck = makeDeck()
     const sorted = allPlayers.filter(p => p.status !== 'spectating').sort((a, b) => a.play_order - b.play_order)
-    await supabase.from('bj_rooms').update({ status: 'dealing' }).eq('id', room.id)
-    await new Promise(r => setTimeout(r, 300))
+    const remaining = [...newDeck]
 
-    const hands = sorted.map((_, i) => [newDeck[i]])
-    const dealerCard1 = newDeck[sorted.length]
-    for (let i = 0; i < sorted.length; i++) hands[i].push(newDeck[sorted.length + 1 + i])
-    const dealerCard2 = newDeck[sorted.length * 2 + 1]
-    const dealerH = [dealerCard1, dealerCard2]
-    const remaining = newDeck.slice(sorted.length * 2 + 2)
+    await supabase.from('bj_rooms').update({ status: 'dealing', deck_remaining: remaining }).eq('id', room.id)
+    await new Promise(r => setTimeout(r, 400))
 
+    // 1枚目：プレイヤー全員に1枚ずつ
+    const hands = sorted.map(() => [])
     for (let i = 0; i < sorted.length; i++) {
-      await supabase.from('bj_players').update({ hand: hands[i], status: 'waiting' }).eq('id', sorted[i].id)
-      await new Promise(r => setTimeout(r, 350))
+      const card = remaining.shift()
+      hands[i].push(card)
+      // 自分のカードはローカルでも更新して即アニメーション
+      await supabase.from('bj_players').update({ hand: [card], status: 'dealing' }).eq('id', sorted[i].id)
+      await supabase.from('bj_rooms').update({ deck_remaining: remaining }).eq('id', room.id)
+      await new Promise(r => setTimeout(r, 500))
     }
+
+    // ディーラー1枚目（表向き）
+    const dealerCard1 = remaining.shift()
+    await supabase.from('bj_rooms').update({ dealer_hand: [dealerCard1], deck_remaining: remaining }).eq('id', room.id)
+    await new Promise(r => setTimeout(r, 500))
+
+    // 2枚目：プレイヤー全員に1枚ずつ
+    for (let i = 0; i < sorted.length; i++) {
+      const card = remaining.shift()
+      hands[i].push(card)
+      await supabase.from('bj_players').update({ hand: hands[i], status: 'waiting' }).eq('id', sorted[i].id)
+      await supabase.from('bj_rooms').update({ deck_remaining: remaining }).eq('id', room.id)
+      await new Promise(r => setTimeout(r, 500))
+    }
+
+    // ディーラー2枚目（裏向き）
+    const dealerCard2 = remaining.shift()
+    const dealerH = [dealerCard1, dealerCard2]
+    await new Promise(r => setTimeout(r, 300))
     await supabase.from('bj_rooms').update({
       dealer_hand: dealerH, status: 'playing',
       current_player_order: 0, deck_remaining: remaining
