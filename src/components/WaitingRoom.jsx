@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
-import { makeDeck } from '../lib/game'
 
 export default function WaitingRoom({ room, player, onStart }) {
   const [players, setPlayers] = useState([])
@@ -9,6 +8,9 @@ export default function WaitingRoom({ room, player, onStart }) {
     fetchPlayers()
     const ch = supabase.channel('waiting-' + room.id)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bj_players', filter: `room_id=eq.${room.id}` }, fetchPlayers)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'bj_rooms', filter: `id=eq.${room.id}` }, (payload) => {
+        if (payload.new.status === 'betting') onStart()
+      })
       .subscribe()
     return () => supabase.removeChannel(ch)
   }, [room.id])
@@ -19,32 +21,16 @@ export default function WaitingRoom({ room, player, onStart }) {
   }
 
   async function startGame() {
-    const deck = makeDeck()
-    // 全プレイヤーに2枚ずつ配る
-    const updatedPlayers = players.map((p, i) => ({
-      ...p,
-      hand: [deck[i * 2], deck[i * 2 + 1]],
-      status: 'betting'
-    }))
-    const dealerHand = [deck[players.length * 2], deck[players.length * 2 + 1]]
-    const remainingDeck = deck.slice(players.length * 2 + 2)
-
-    // DBを更新
-    await supabase.from('bj_rooms').update({
-      status: 'playing',
-      dealer_hand: dealerHand,
-      round: room.round + 1
-    }).eq('id', room.id)
-
-    for (const p of updatedPlayers) {
+    const shuffled = [...players].sort(() => Math.random() - 0.5)
+    for (let i = 0; i < shuffled.length; i++) {
       await supabase.from('bj_players').update({
-        hand: p.hand,
-        status: 'betting',
-        bet: 0
-      }).eq('id', p.id)
+        play_order: i, status: 'betting', hand: [], bet: 0
+      }).eq('id', shuffled[i].id)
     }
-
-    onStart({ deck: remainingDeck, dealerHand })
+    await supabase.from('bj_rooms').update({
+      status: 'betting', dealer_hand: [],
+      round: (room.round || 0) + 1, current_player_order: -1
+    }).eq('id', room.id)
   }
 
   const slots = Array(4).fill(null).map((_, i) => players[i] || null)
@@ -58,7 +44,6 @@ export default function WaitingRoom({ room, player, onStart }) {
           友達にこのコードを共有してください
         </div>
       </div>
-
       <div className="players-list">
         <div className="players-list-title">参加プレイヤー（{players.length}/4）</div>
         {slots.map((p, i) => (
@@ -76,14 +61,8 @@ export default function WaitingRoom({ room, player, onStart }) {
           )
         ))}
       </div>
-
       {player.is_host ? (
-        <button
-          className="lobby-btn btn-create"
-          style={{ width: 280 }}
-          onClick={startGame}
-          disabled={players.length < 1}
-        >
+        <button className="lobby-btn btn-create" style={{ width: 280 }} onClick={startGame} disabled={players.length < 1}>
           {players.length < 2 ? `あと${2 - players.length}人待機中...` : `✦ ゲームスタート（${players.length}人）`}
         </button>
       ) : (

@@ -1,24 +1,23 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
 import {
   handValue, isSoft, isPair, isRed, cardVal,
-  calcResult, makeDeck, dealerPlay, CHIP_COLORS
+  calcResult, makeDeck, CHIP_COLORS
 } from '../lib/game'
 import OtherPlayer from './OtherPlayer'
 
-export default function GameScreen({ room, player, initialDeck, initialDealerHand }) {
-  // 自分の手札・ゲーム状態
+export default function GameScreen({ room, player }) {
   const [playerHand, setPlayerHand] = useState([])
-  const [dealerHand, setDealerHand] = useState(initialDealerHand || [])
-  const [deck, setDeck] = useState(initialDeck || [])
+  const [dealerHand, setDealerHand] = useState([])
+  const [deck, setDeck] = useState([])
   const [points, setPoints] = useState(player.points || 1000)
   const [bet, setBet] = useState(0)
-  const [status, setStatus] = useState('betting') // betting/playing/end
+  const [myStatus, setMyStatus] = useState('betting')
   const [firstTurn, setFirstTurn] = useState(true)
   const [extraMode, setExtraMode] = useState(null)
   const [extraBet, setExtraBet] = useState(0)
   const [hintOn, setHintOn] = useState(true)
-  const [hintText, setHintText] = useState('チップを選んでベットし、Deal を押してください。')
+  const [hintText, setHintText] = useState('チップを選んでベットしてください。')
   const [resultSummary, setResultSummary] = useState(null)
   const [stats, setStats] = useState({ w: 0, l: 0, p: 0 })
   const [dramaText, setDramaText] = useState('')
@@ -26,64 +25,204 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
   const [dramaClass, setDramaClass] = useState('')
   const [dealerResult, setDealerResult] = useState(null)
   const [playerResult, setPlayerResult] = useState(null)
-  const [showCards, setShowCards] = useState(false)
-
-  // 他プレイヤー
   const [allPlayers, setAllPlayers] = useState([])
   const [currentRoom, setCurrentRoom] = useState(room)
+  const [phase, setPhase] = useState('betting') // betting/dealing/myturn/waiting/dealer/end
+  const [myPlayOrder, setMyPlayOrder] = useState(0)
+  const [dealingCards, setDealingCards] = useState([]) // アニメーション中のカード
+  const [showDealerSecond, setShowDealerSecond] = useState(false)
 
-  const deckRef = useRef(deck)
-  deckRef.current = deck
+  const deckRef = useRef([])
+  const allPlayersRef = useRef([])
+  allPlayersRef.current = allPlayers
 
-  // Realtime購読
   useEffect(() => {
-    fetchState()
+    fetchAll()
     const ch = supabase.channel('game-' + room.id)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'bj_players', filter: `room_id=eq.${room.id}` }, fetchState)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'bj_rooms', filter: `id=eq.${room.id}` }, fetchRoom)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'bj_players', filter: `room_id=eq.${room.id}` }, fetchAll)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'bj_rooms', filter: `id=eq.${room.id}` }, handleRoomUpdate)
       .subscribe()
     return () => supabase.removeChannel(ch)
   }, [room.id])
 
-  async function fetchState() {
-    const { data } = await supabase.from('bj_players').select().eq('room_id', room.id).order('created_at')
-    if (data) setAllPlayers(data)
-  }
-
-  async function fetchRoom() {
-    const { data } = await supabase.from('bj_rooms').select().eq('id', room.id).single()
+  async function fetchAll() {
+    const { data } = await supabase.from('bj_players').select().eq('room_id', room.id).order('play_order')
     if (data) {
-      setCurrentRoom(data)
-      setDealerHand(data.dealer_hand || [])
+      setAllPlayers(data)
+      const me = data.find(p => p.id === player.id)
+      if (me) {
+        if (me.hand && me.hand.length > 0) setPlayerHand(me.hand)
+        if (me.points !== undefined) setPoints(me.points)
+        if (me.play_order !== undefined) setMyPlayOrder(me.play_order)
+        if (me.status) setMyStatus(me.status)
+      }
+    }
+    const { data: r } = await supabase.from('bj_rooms').select().eq('id', room.id).single()
+    if (r) {
+      setCurrentRoom(r)
+      if (r.dealer_hand) setDealerHand(r.dealer_hand)
     }
   }
 
-  // 自分の最新データを取得してhandを同期
+  async function handleRoomUpdate(payload) {
+    const r = payload.new
+    setCurrentRoom(r)
+    if (r.dealer_hand) setDealerHand(r.dealer_hand)
+
+    // ベット完了→配牌フェーズ
+    if (r.status === 'betting') {
+      setPhase('betting')
+      setHintText('チップを選んでベットしてください。')
+    }
+
+    // 配牌フェーズ開始（ホストがトリガー）
+    if (r.status === 'dealing') {
+      setPhase('dealing')
+      setHintText('カードを配っています...')
+      setShowDealerSecond(false)
+    }
+
+    // プレイフェーズ：current_player_orderが自分の番か確認
+    if (r.status === 'playing') {
+      const me = allPlayersRef.current.find(p => p.id === player.id)
+      if (me && r.current_player_order === me.play_order) {
+        setPhase('myturn')
+        setFirstTurn(true)
+        setHintText(getHint(me.hand || []))
+      } else {
+        setPhase('waiting')
+        const current = allPlayersRef.current.find(p => p.play_order === r.current_player_order)
+        setHintText(current ? `${current.name} さんのターンです...` : '順番待ちです...')
+      }
+    }
+
+    // ディーラーフェーズ
+    if (r.status === 'dealer') {
+      setPhase('dealer')
+      setShowDealerSecond(true)
+      setHintText('ディーラーがカードを引いています...')
+    }
+
+    // ゲーム終了
+    if (r.status === 'end') {
+      setPhase('end')
+      setShowDealerSecond(true)
+      await fetchAll()
+    }
+  }
+
+  // ベット確定→全員ベット済みかチェック→ホストが配牌開始
   useEffect(() => {
+    if (!player.is_host) return
+    if (phase !== 'betting') return
+    if (allPlayers.length === 0) return
+    const allBetted = allPlayers.every(p => p.status === 'betted' || p.bet > 0)
+    if (allBetted && allPlayers.every(p => p.bet > 0)) {
+      startDealing()
+    }
+  }, [allPlayers, phase])
+
+  async function startDealing() {
+    if (!player.is_host) return
+    const newDeck = makeDeck()
+    const sorted = [...allPlayersRef.current].sort((a, b) => a.play_order - b.play_order)
+
+    await supabase.from('bj_rooms').update({ status: 'dealing' }).eq('id', room.id)
+
+    // 1枚目を全員に配る
+    const hands = sorted.map((_, i) => [newDeck[i]])
+    // ディーラーの1枚目
+    const dealerCard1 = newDeck[sorted.length]
+    // 2枚目を全員に配る
+    for (let i = 0; i < sorted.length; i++) hands[i].push(newDeck[sorted.length + 1 + i])
+    // ディーラーの2枚目（裏向き）
+    const dealerCard2 = newDeck[sorted.length * 2 + 1]
+    const dealerH = [dealerCard1, dealerCard2]
+    const remaining = newDeck.slice(sorted.length * 2 + 2)
+
+    // 少し間を置いてDBを更新（配る演出のため）
+    await new Promise(r => setTimeout(r, 500))
+    for (let i = 0; i < sorted.length; i++) {
+      await supabase.from('bj_players').update({ hand: hands[i], status: 'waiting' }).eq('id', sorted[i].id)
+      await new Promise(r => setTimeout(r, 400))
+    }
+    await supabase.from('bj_rooms').update({
+      dealer_hand: dealerH,
+      status: 'playing',
+      current_player_order: 0,
+      deck_remaining: remaining
+    }).eq('id', room.id)
+    deckRef.current = remaining
+    setDeck(remaining)
+  }
+
+  // 自分のターン終了→次のプレイヤーへ or ディーラーへ
+  async function advanceTurn(finalHand, finalPoints) {
+    const sorted = [...allPlayersRef.current].sort((a, b) => a.play_order - b.play_order)
+    const nextOrder = myPlayOrder + 1
+    if (nextOrder < sorted.length) {
+      await supabase.from('bj_rooms').update({ current_player_order: nextOrder }).eq('id', room.id)
+    } else {
+      // 全員終了→ディーラーフェーズ
+      await supabase.from('bj_rooms').update({ status: 'dealer', current_player_order: -1 }).eq('id', room.id)
+      if (player.is_host) {
+        await runDealer()
+      }
+    }
+  }
+
+  async function runDealer() {
+    const { data: r } = await supabase.from('bj_rooms').select().eq('id', room.id).single()
+    let dHand = [...(r.dealer_hand || dealerHand)]
+    let remainingDeck = [...(r.deck_remaining || deckRef.current)]
+
+    setShowDealerSecond(true)
+
+    while (handValue(dHand) < 17) {
+      await new Promise(r => setTimeout(r, 700))
+      const card = remainingDeck.pop()
+      dHand = [...dHand, card]
+      setDealerHand([...dHand])
+      await supabase.from('bj_rooms').update({ dealer_hand: dHand }).eq('id', room.id)
+      if (handValue(dHand) > 21) {
+        setDealerResult({ text: 'BUST!', cls: 'zr-bust' })
+        break
+      }
+    }
+
+    // 全プレイヤーの結果を計算
+    const dv = handValue(dHand)
+    const { data: players } = await supabase.from('bj_players').select().eq('room_id', room.id)
+    for (const p of players) {
+      const pv = handValue(p.hand || [])
+      const isBJ = pv === 21 && (p.hand || []).length === 2
+      const res = calcResult(pv, dv, p.bet, isBJ, dHand)
+      const newPts = (p.points || 1000) + res.delta
+      await supabase.from('bj_players').update({ points: newPts, status: 'done', result: res.type }).eq('id', p.id)
+    }
+
+    await supabase.from('bj_rooms').update({ status: 'end', dealer_hand: dHand }).eq('id', room.id)
+  }
+
+  // 自分の結果を表示
+  useEffect(() => {
+    if (phase !== 'end') return
     const me = allPlayers.find(p => p.id === player.id)
-    if (me && me.hand && me.hand.length > 0 && playerHand.length === 0) {
-      setPlayerHand(me.hand)
-    }
-    if (me && me.points !== undefined && status === 'end') {
-      setPoints(me.points)
-    }
-  }, [allPlayers])
-
-  // 全員がdoneになったらカードを公開
-  useEffect(() => {
-    const others = allPlayers.filter(p => p.id !== player.id)
-    if (others.length > 0 && others.every(p => ['stand','bust','bj','done'].includes(p.status))) {
-      setShowCards(true)
-    }
-  }, [allPlayers])
-
-  async function updateMyStatus(newStatus, newHand, newPoints, newBet) {
-    const update = { status: newStatus }
-    if (newHand !== undefined) update.hand = newHand
-    if (newPoints !== undefined) update.points = newPoints
-    if (newBet !== undefined) update.bet = newBet
-    await supabase.from('bj_players').update(update).eq('id', player.id)
-  }
+    if (!me) return
+    const dv = handValue(dealerHand)
+    const pv = handValue(me.hand || [])
+    const isBJ = pv === 21 && (me.hand || []).length === 2
+    const res = calcResult(pv, dv, me.bet || bet, isBJ, dealerHand)
+    setPlayerResult({ text: res.badge, cls: res.cls })
+    setResultSummary({ msg: res.badge + (res.delta > 0 ? ` +${res.delta}` : ` ${res.delta}`) + ' pt', cls: 'r-' + res.type })
+    setPoints(me.points || points)
+    const newStats = { ...stats }
+    if (res.delta > 0) newStats.w++
+    else if (res.delta < 0) newStats.l++
+    else newStats.p++
+    setStats(newStats)
+    showDrama(res.badge.includes('WIN') || res.badge.includes('BJ') ? 'WIN !' : res.badge === 'BUST' || res.badge === 'LOSE' ? 'LOSE…' : 'PUSH', res.badge.includes('WIN') || res.badge.includes('BJ') ? '#7dffb3' : res.badge === 'BUST' || res.badge === 'LOSE' ? '#ff6060' : '#ffe77a', 1000)
+  }, [phase, allPlayers])
 
   function showDrama(text, color, duration) {
     return new Promise(resolve => {
@@ -95,57 +234,176 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
     })
   }
 
-  function setOff(id, off) {
-    const el = document.getElementById(id)
-    if (!el) return
-    if (off) el.setAttribute('data-off', '1')
-    else el.removeAttribute('data-off')
-  }
-
-  function setPhase(phase) {
-    const playing = phase === 'playing'
-    const betting = phase === 'betting'
-    const end = phase === 'end'
-    setOff('btn-deal-felt', !betting)
-    const df = document.getElementById('btn-new-felt')
-    if (df) df.style.display = end ? 'block' : 'none'
-    setOff('btn-hit', !playing)
-    setOff('btn-stay', !playing)
-    const pv = handValue(playerHand)
-    const canDbl = playing && firstTurn && playerHand.length === 2
-    setOff('btn-double', !canDbl)
-    const canSplit = playing && firstTurn && playerHand.length === 2 && cardVal(playerHand[0]?.r) === cardVal(playerHand[1]?.r) && points >= bet
-    setOff('btn-split', !canSplit)
-    const canSurrender = playing && firstTurn && playerHand.length === 2
-    setOff('btn-surrender', !canSurrender)
-    ;[5, 10, 25, 50, 100].forEach(v => setOff('chip-' + v, !betting && !extraMode))
-  }
-
   function getHint(hand) {
     const pv = handValue(hand)
-    const soft = isSoft(hand)
-    const pair = isPair(hand)
-    const canDouble = firstTurn && hand.length === 2
-    const canSplit = firstTurn && hand.length === 2 && cardVal(hand[0]?.r) === cardVal(hand[1]?.r)
     if (pv === 21 && hand.length === 2) return '<span class="tag">Blackjack</span>最初の2枚で21！<strong>ブラックジャック</strong>です🎉'
     if (pv > 21) return '<span class="tag">Bust</span>合計が<strong>21を超えた</strong>のでバースト。'
+    const canDouble = firstTurn && hand.length === 2
+    const canSplit = firstTurn && hand.length === 2 && hand[0] && hand[1] && cardVal(hand[0].r) === cardVal(hand[1].r)
     const msgs = []
-    if (canSplit) msgs.push('<span class="tag">Split</span>同じ数字2枚！2つの手に分けて別々に戦えます。')
-    if (canDouble) msgs.push('<span class="tag">Double</span>最初の2枚限定。追加チップを置いて1枚だけ引きます。')
+    if (canSplit) msgs.push('<span class="tag">Split</span>同じ数字2枚！2つの手に分けて戦えます。')
+    if (canDouble) msgs.push('<span class="tag">Double</span>最初の2枚限定。追加チップを置いて1枚引きます。')
     if (firstTurn && hand.length === 2) msgs.push('<span class="tag">Surrender</span>勝ち目が薄いと思ったら降参できます。半額返還。')
-    if (soft) msgs.push('<span class="tag">Soft Hand</span>Aは<strong>1か11</strong>どちらにも使えます。')
+    if (isSoft(hand)) msgs.push('<span class="tag">Soft Hand</span>Aは<strong>1か11</strong>どちらにも使えます。')
     if (msgs.length > 0) return msgs[0]
-    if (pv <= 11) return `合計<strong>${pv}</strong>。まだ余裕あり。<strong>Hit</strong>でカードを追加できます。`
-    if (pv >= 17) return `合計<strong>${pv}</strong>。<strong>Stay</strong>でこのままディーラーと勝負できます。`
+    if (pv <= 11) return `合計<strong>${pv}</strong>。<strong>Hit</strong>でカードを追加できます。`
+    if (pv >= 17) return `合計<strong>${pv}</strong>。<strong>Stay</strong>でこのままディーラーと勝負。`
     return `合計<strong>${pv}</strong>。<strong>Hit</strong>でもう1枚、<strong>Stay</strong>で勝負。`
   }
 
-  useEffect(() => {
-    if (status === 'playing' && playerHand.length > 0) {
-      setHintText(getHint(playerHand))
+  async function confirmBet() {
+    if (bet === 0) { setHintText('チップを選んでベットしてください！'); return }
+    await supabase.from('bj_players').update({ bet, status: 'betted' }).eq('id', player.id)
+    setMyStatus('betted')
+    setHintText('ベット完了！他のプレイヤーを待っています...')
+  }
+
+  async function doHit() {
+    if (phase !== 'myturn') return
+    setFirstTurn(false)
+    const { data: r } = await supabase.from('bj_rooms').select('deck_remaining').eq('id', room.id).single()
+    const d = r?.deck_remaining || deckRef.current
+    const newDeck = [...d]
+    const card = newDeck.pop()
+    const newHand = [...playerHand, card]
+    setPlayerHand(newHand)
+    setDeck(newDeck)
+    deckRef.current = newDeck
+    await supabase.from('bj_rooms').update({ deck_remaining: newDeck }).eq('id', room.id)
+    await supabase.from('bj_players').update({ hand: newHand, status: 'playing' }).eq('id', player.id)
+    if (handValue(newHand) >= 21) {
+      await finishMyTurn(newHand)
+    } else {
+      setHintText(getHint(newHand))
     }
-    setPhase(status)
-  }, [status, playerHand, firstTurn, extraMode])
+  }
+
+  async function doStay() {
+    if (phase !== 'myturn') return
+    setFirstTurn(false)
+    await supabase.from('bj_players').update({ status: 'stand' }).eq('id', player.id)
+    setMyStatus('stand')
+    await advanceTurn(playerHand, points)
+  }
+
+  async function finishMyTurn(hand) {
+    const h = hand || playerHand
+    const pv = handValue(h)
+    const newStatus = pv > 21 ? 'bust' : pv === 21 && h.length === 2 ? 'bj' : 'stand'
+    await supabase.from('bj_players').update({ hand: h, status: newStatus }).eq('id', player.id)
+    setMyStatus(newStatus)
+    await advanceTurn(h, points)
+  }
+
+  async function doDouble() {
+    if (extraMode) return
+    setExtraMode('double')
+    setExtraBet(0)
+    setHintText(`<span class="tag">Double</span>追加ベットを置いてください（最大 <strong>${bet} pt</strong>）。`)
+  }
+
+  async function doSplit() {
+    if (extraMode) return
+    setExtraMode('split')
+    setExtraBet(0)
+    setHintText(`<span class="tag">Split</span>追加ベットを置いてください（最大 <strong>${bet} pt</strong>）。`)
+  }
+
+  async function confirmAction() {
+    if (extraBet === 0) return
+    const mode = extraMode
+    setExtraMode(null)
+    setExtraBet(0)
+    const cf = document.getElementById('btn-action-confirm')
+    if (cf) cf.style.display = 'none'
+
+    if (mode === 'double') {
+      const newBet = bet + extraBet
+      setBet(newBet)
+      setFirstTurn(false)
+      const { data: r } = await supabase.from('bj_rooms').select('deck_remaining').eq('id', room.id).single()
+      const d = r?.deck_remaining || deckRef.current
+      const newDeck = [...d]
+      const card = newDeck.pop()
+      const newHand = [...playerHand, card]
+      setPlayerHand(newHand)
+      deckRef.current = newDeck
+      await supabase.from('bj_rooms').update({ deck_remaining: newDeck }).eq('id', room.id)
+      await supabase.from('bj_players').update({ hand: newHand, bet: newBet, status: 'stand' }).eq('id', player.id)
+      await advanceTurn(newHand, points)
+    } else if (mode === 'split') {
+      setFirstTurn(false)
+      const { data: r } = await supabase.from('bj_rooms').select('deck_remaining').eq('id', room.id).single()
+      const d = r?.deck_remaining || deckRef.current
+      const newDeck = [...d]
+      const card = newDeck.pop()
+      const hand1 = [playerHand[0], card]
+      setPlayerHand(hand1)
+      deckRef.current = newDeck
+      await supabase.from('bj_rooms').update({ deck_remaining: newDeck }).eq('id', room.id)
+      await supabase.from('bj_players').update({ hand: hand1 }).eq('id', player.id)
+      setHintText(`<span class="tag">Split</span>Hand 1をプレイします。`)
+    }
+  }
+
+  async function doSurrender() {
+    if (phase !== 'myturn') return
+    const ret = Math.floor(bet / 2)
+    const newPoints = points + ret
+    setPoints(newPoints)
+    setPlayerResult({ text: 'FOLD', cls: 'zr-push' })
+    await supabase.from('bj_players').update({ status: 'stand', points: newPoints }).eq('id', player.id)
+    await advanceTurn(playerHand, newPoints)
+  }
+
+  async function resetRound() {
+    setBet(0); setPlayerHand([]); setDealerHand([])
+    setFirstTurn(true); setExtraMode(null); setExtraBet(0)
+    setResultSummary(null); setDealerResult(null); setPlayerResult(null)
+    setShowDealerSecond(false); setMyStatus('betting'); setPhase('betting')
+    setHintText('チップを選んでベットしてください。')
+    await supabase.from('bj_players').update({ hand: [], bet: 0, status: 'betting', result: null }).eq('id', player.id)
+    if (player.is_host) {
+      const sorted = [...allPlayersRef.current].sort(() => Math.random() - 0.5)
+      for (let i = 0; i < sorted.length; i++) {
+        await supabase.from('bj_players').update({ play_order: i, hand: [], bet: 0, status: 'betting' }).eq('id', sorted[i].id)
+      }
+      await supabase.from('bj_rooms').update({
+        status: 'betting', dealer_hand: [], current_player_order: -1,
+        round: (currentRoom.round || 0) + 1, deck_remaining: []
+      }).eq('id', room.id)
+    }
+  }
+
+  function chipClick(v) {
+    if (extraMode) {
+      if (extraBet + v > bet || extraBet + v > points - bet) return
+      const nb = extraBet + v
+      setExtraBet(nb)
+      if (nb > 0) { const cf = document.getElementById('btn-action-confirm'); if (cf) cf.style.display = 'block' }
+    } else {
+      if (phase !== 'betting' || myStatus === 'betted') return
+      if (bet + v > points) return
+      setBet(b => b + v)
+    }
+  }
+
+  function clearChip() {
+    if (extraMode) { setExtraBet(0); const cf = document.getElementById('btn-action-confirm'); if (cf) cf.style.display = 'none' }
+    else { if (myStatus === 'betted') return; setBet(0) }
+  }
+
+  const isMyTurn = phase === 'myturn'
+  const isBetting = phase === 'betting' && myStatus !== 'betted'
+  const isEnd = phase === 'end'
+  const pv = handValue(playerHand)
+  const dv = handValue(dealerHand)
+  const otherPlayers = allPlayers.filter(p => p.id !== player.id)
+  const maxPoints = Math.max(...allPlayers.map(p => p.points || 0), 1)
+
+  // 現在のプレイヤーを強調
+  const currentPlayerOrder = currentRoom.current_player_order
+  const currentPlayer = allPlayers.find(p => p.play_order === currentPlayerOrder)
 
   function renderBetChips() {
     const chips = []
@@ -159,229 +417,19 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
     return chips
   }
 
-  function chipClick(v) {
-    if (extraMode) {
-      if (extraBet + v > bet) return
-      if (extraBet + v > points - bet) return
-      const nb = extraBet + v
-      setExtraBet(nb)
-      if (nb > 0) {
-        const cf = document.getElementById('btn-action-confirm')
-        if (cf) cf.style.display = 'block'
-      }
-    } else {
-      if (status !== 'betting') return
-      if (bet + v > points) return
-      setBet(b => b + v)
-    }
-  }
-
-  function clearChip() {
-    if (extraMode) {
-      setExtraBet(0)
-      const cf = document.getElementById('btn-action-confirm')
-      if (cf) cf.style.display = 'none'
-    } else {
-      if (status !== 'betting') return
-      setBet(0)
-    }
-  }
-
-  async function doDeal() {
-    if (bet === 0) { setHintText('まずチップを選んでベットしてください！'); return }
-    const me = allPlayers.find(p => p.id === player.id)
-    const hand = me?.hand || []
-    if (hand.length === 0) return
-    setPlayerHand(hand)
-    setFirstTurn(true)
-    setResultSummary(null)
-    setDealerResult(null)
-    setPlayerResult(null)
-    setStatus('playing')
-    setShowCards(false)
-    await updateMyStatus('playing', hand, undefined, bet)
-    if (handValue(hand) === 21) {
-      setTimeout(() => triggerStand(hand, deckRef.current), 400)
-    } else {
-      setHintText(getHint(hand))
-    }
-  }
-
-  async function doHit() {
-    setFirstTurn(false)
-    const newDeck = [...deckRef.current]
-    const newCard = newDeck.pop()
-    const newHand = [...playerHand, newCard]
-    setDeck(newDeck)
-    setPlayerHand(newHand)
-    await updateMyStatus('playing', newHand)
-    if (handValue(newHand) >= 21) {
-      setTimeout(() => triggerStand(newHand, newDeck), 400)
-    } else {
-      setHintText(getHint(newHand))
-    }
-  }
-
-  async function triggerStand(hand, currentDeck) {
-    const h = hand || playerHand
-    const d = currentDeck || deckRef.current
-    setFirstTurn(false)
-    setStatus('end')
-    setHintText('ディーラーがカードを引いています...')
-    await updateMyStatus('stand', h)
-    await runDealerAndFinish(h, d)
-  }
-
-  async function doStay() {
-    await triggerStand(playerHand, deckRef.current)
-  }
-
-  async function runDealerAndFinish(hand, currentDeck) {
-    const { hand: newDealerHand, deck: newDeck } = dealerPlay(dealerHand, currentDeck)
-    setDeck(newDeck)
-    setDealerHand(newDealerHand)
-    const dv = handValue(newDealerHand)
-    if (dv > 21) setDealerResult({ text: 'BUST!', cls: 'zr-bust' })
-    await supabase.from('bj_rooms').update({ dealer_hand: newDealerHand }).eq('id', room.id)
-    await new Promise(r => setTimeout(r, 300))
-    const pv = handValue(hand)
-    const isBJ = pv === 21 && hand.length === 2
-    const res = calcResult(pv, dv, bet, isBJ, newDealerHand)
-    const newPoints = points + res.delta
-    setPoints(newPoints)
-    setPlayerResult({ text: res.badge, cls: res.cls })
-    setResultSummary({ msg: res.badge + (res.delta > 0 ? ` +${res.delta}` : ` ${res.delta}`) + ' pt', cls: 'r-' + res.type })
-    await showDrama(res.badge === 'WIN!' ? 'WIN !' : res.badge === 'BUST' ? 'BUST…' : res.badge === 'BJ! +' + Math.floor(bet * 1.5) ? 'Blackjack!!' : res.badge, res.badge.includes('WIN') ? '#7dffb3' : res.badge === 'BUST' || res.badge === 'LOSE' ? '#ff6060' : '#ffe77a', 900)
-    await updateMyStatus('done', hand, newPoints)
-    const newStats = { ...stats }
-    if (res.delta > 0) newStats.w++
-    else if (res.delta < 0) newStats.l++
-    else newStats.p++
-    setStats(newStats)
-  }
-
-  async function doDouble() {
-    startExtra('double')
-  }
-
-  async function doSplit() {
-    startExtra('split')
-  }
-
-  function startExtra(mode) {
-    setExtraMode(mode)
-    setExtraBet(0)
-    setStatus('extra')
-    const msg = mode === 'double'
-      ? `<span class="tag">Double Down</span>追加ベットを置いてください（最大 <strong>${bet} pt</strong>）。`
-      : `<span class="tag">Split</span>Hand 2用の追加ベットを置いてください（最大 <strong>${bet} pt</strong>）。`
-    setHintText(msg)
-    ;[5, 10, 25, 50, 100].forEach(v => {
-      const el = document.getElementById('chip-' + v)
-      if (el) { el.removeAttribute('data-off'); el.classList.add('extra-mode') }
-    })
-  }
-
-  async function confirmAction() {
-    if (extraBet === 0) return
-    const mode = extraMode
-    setExtraMode(null)
-    setExtraBet(0)
-    ;[5, 10, 25, 50, 100].forEach(v => {
-      const el = document.getElementById('chip-' + v)
-      if (el) el.classList.remove('extra-mode')
-    })
-    const cf = document.getElementById('btn-action-confirm')
-    if (cf) cf.style.display = 'none'
-
-    if (mode === 'double') {
-      const newBet = bet + extraBet
-      setBet(newBet)
-      setFirstTurn(false)
-      const newDeck = [...deckRef.current]
-      const newCard = newDeck.pop()
-      const newHand = [...playerHand, newCard]
-      setDeck(newDeck)
-      setPlayerHand(newHand)
-      setHintText(`<span class="tag">Double</span>ベットを<strong>${newBet} pt</strong>にして1枚引きました！`)
-      setStatus('end')
-      await updateMyStatus('stand', newHand, undefined, newBet)
-      setTimeout(() => runDealerAndFinish(newHand, newDeck), 600)
-    } else if (mode === 'split') {
-      // Split: 簡易実装（Hand1だけプレイ）
-      setFirstTurn(false)
-      const newDeck = [...deckRef.current]
-      const card1 = newDeck.pop()
-      const hand1 = [playerHand[0], card1]
-      setDeck(newDeck)
-      setPlayerHand(hand1)
-      setStatus('playing')
-      await updateMyStatus('playing', hand1)
-      setHintText(`<span class="tag">Split</span>Hand 1をプレイします。`)
-    }
-  }
-
-  async function doSurrender() {
-    const ret = Math.floor(bet / 2)
-    const newPoints = points + ret
-    setPoints(newPoints)
-    setPlayerResult({ text: 'FOLD', cls: 'zr-push' })
-    setResultSummary({ msg: `Surrender — ${ret} pt 返還`, cls: 'r-push' })
-    await showDrama('SURRENDER', '#e8c8e8', 900)
-    await updateMyStatus('done', playerHand, newPoints)
-    setStatus('end')
-    const newStats = { ...stats, l: stats.l + 1 }
-    setStats(newStats)
-  }
-
-  async function resetRound() {
-    setBet(0)
-    setPlayerHand([])
-    setDealerHand([])
-    setFirstTurn(true)
-    setExtraMode(null)
-    setExtraBet(0)
-    setResultSummary(null)
-    setDealerResult(null)
-    setPlayerResult(null)
-    setShowCards(false)
-    setStatus('waiting')
-    setHintText('ホストが次のラウンドを開始するまでお待ちください。')
-    await updateMyStatus('waiting', [], points, 0)
-    if (player.is_host) {
-      const newDeck = makeDeck()
-      const allP = allPlayers
-      for (let i = 0; i < allP.length; i++) {
-        const hand = [newDeck[i * 2], newDeck[i * 2 + 1]]
-        await supabase.from('bj_players').update({ hand, status: 'betting', bet: 0 }).eq('id', allP[i].id)
-      }
-      const dealerH = [newDeck[allP.length * 2], newDeck[allP.length * 2 + 1]]
-      const remaining = newDeck.slice(allP.length * 2 + 2)
-      setDeck(remaining)
-      setDealerHand(dealerH)
-      await supabase.from('bj_rooms').update({ dealer_hand: dealerH, status: 'playing', round: (currentRoom.round || 0) + 1 }).eq('id', room.id)
-      setBet(0)
-      setStatus('betting')
-      setHintText('チップを選んでベットし、Deal を押してください。')
-    }
-  }
-
   const betChips = renderBetChips()
-  const otherPlayers = allPlayers.filter(p => p.id !== player.id)
-  const maxPoints = Math.max(...allPlayers.map(p => p.points || 0), 1)
-  const pv = handValue(playerHand)
-  const dv = handValue(dealerHand)
+  const canDouble = isMyTurn && firstTurn && playerHand.length === 2
+  const canSplit = isMyTurn && firstTurn && playerHand.length === 2 && playerHand[0] && playerHand[1] && cardVal(playerHand[0].r) === cardVal(playerHand[1].r)
+  const canSurrender = isMyTurn && firstTurn && playerHand.length === 2
 
   return (
     <div className="game-screen">
       {/* 左：自分のカジノ画面 */}
       <div className="my-panel">
         <div className="table-arc" />
-        {/* ドラマ */}
         <div className={`drama-overlay ${dramaClass}`}>
           <div className="drama-text" style={{ color: dramaColor }}>{dramaText}</div>
         </div>
-
         <div className="felt-content">
           <div className="logo-text">Royal Blackjack — {room.room_code}</div>
 
@@ -390,9 +438,9 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
             <div className="zone-tag">Dealer</div>
             <div className="cards-row">
               {dealerHand.map((c, i) => {
-                const faceDown = status !== 'end' && i === 1
+                const faceDown = i === 1 && !showDealerSecond
                 return (
-                  <div key={i} className={`card${faceDown ? ' face-down' : (isRed(c.s) ? ' red' : ' black')}`}>
+                  <div key={i} className={`card animate-in${faceDown ? ' face-down' : (isRed(c.s) ? ' red' : ' black')}`}>
                     {!faceDown && <><div className="card-rank">{c.r}</div><div className="card-suit">{c.s}</div></>}
                   </div>
                 )
@@ -403,7 +451,7 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
                 <div className={`zone-result show ${dealerResult.cls}`}>{dealerResult.text}</div>
               ) : (
                 <div className={`score-pill${dv > 21 ? ' bust' : ''}`}>
-                  {status !== 'end' && dealerHand.length > 0 ? `${cardVal(dealerHand[0]?.r)} + ?` : (dv || '—')}
+                  {dealerHand.length === 0 ? '—' : !showDealerSecond ? `${cardVal(dealerHand[0]?.r)} + ?` : dv}
                 </div>
               )}
             </div>
@@ -419,8 +467,17 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
                   <div key={i} className={`bet-chip-sm${c.extra ? ' extra' : ''}`} style={{ background: CHIP_COLORS[c.d] }}>{c.d}</div>
               )}
             </div>
-            <button id="btn-deal-felt" className="center-btn" onClick={doDeal}>✦ Deal ✦</button>
-            <button id="btn-new-felt" className="center-btn" onClick={resetRound} style={{ display: 'none', background: 'rgba(220,210,190,0.9)', color: '#2a2010' }}>↺ Next</button>
+            {isBetting && (
+              <button className="center-btn" style={{ background: 'linear-gradient(135deg,#d4af37,#f5d76e,#b8860b)', color: '#1a0a00' }} onClick={confirmBet}>
+                ✦ Bet ✦
+              </button>
+            )}
+            {myStatus === 'betted' && phase === 'betting' && (
+              <div style={{ fontSize: 11, color: 'rgba(212,175,55,0.7)', fontFamily: 'sans-serif' }}>ベット完了 — 待機中...</div>
+            )}
+            {isEnd && (
+              <button className="center-btn" onClick={resetRound} style={{ background: 'rgba(220,210,190,0.9)', color: '#2a2010' }}>↺ Next Round</button>
+            )}
             <button id="btn-action-confirm" className="center-btn" onClick={confirmAction} style={{ display: 'none', background: 'linear-gradient(135deg,#e8c840,#f5e060,#c8a800)', color: '#2a1a00' }}>✦ OK ✦</button>
           </div>
 
@@ -431,9 +488,10 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
                 <div className={`zone-result show ${playerResult.cls}`}>{playerResult.text}</div>
               ) : (
                 <div className={`score-pill${pv > 21 ? ' bust' : pv === 21 && playerHand.length === 2 ? ' bj' : ''}`}>
-                  {pv || '—'}
+                  {playerHand.length === 0 ? '—' : pv}
                 </div>
               )}
+              {isMyTurn && <div style={{ fontSize: 10, background: 'rgba(46,204,113,0.3)', color: '#7dffb3', padding: '2px 8px', borderRadius: 10, fontFamily: 'sans-serif' }}>あなたのターン</div>}
             </div>
             <div className="cards-row">
               {playerHand.map((c, i) => (
@@ -447,19 +505,19 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
 
             {/* アクションボタン */}
             <div className="action-row">
-              <button id="btn-hit" className="abtn abtn-hit" onClick={doHit} data-off="1">
+              <button className={`abtn abtn-hit${!isMyTurn ? ' disabled' : ''}`} onClick={doHit} {...(!isMyTurn ? { 'data-off': '1' } : {})}>
                 <div className="abtn-icon">＋</div><div className="abtn-label">Hit</div>
               </button>
-              <button id="btn-stay" className="abtn abtn-stay" onClick={doStay} data-off="1">
+              <button className={`abtn abtn-stay`} onClick={doStay} {...(!isMyTurn ? { 'data-off': '1' } : {})}>
                 <div className="abtn-icon">■</div><div className="abtn-label">Stay</div>
               </button>
-              <button id="btn-double" className="abtn abtn-double" onClick={doDouble} data-off="1">
+              <button className="abtn abtn-double" onClick={doDouble} {...(!canDouble ? { 'data-off': '1' } : {})}>
                 <div className="abtn-icon">×2</div><div className="abtn-label">Double</div>
               </button>
-              <button id="btn-split" className="abtn abtn-split" onClick={doSplit} data-off="1">
+              <button className="abtn abtn-split" onClick={doSplit} {...(!canSplit ? { 'data-off': '1' } : {})}>
                 <div className="abtn-icon">⇌</div><div className="abtn-label">Split</div>
               </button>
-              <button id="btn-surrender" className="abtn abtn-surrender" onClick={doSurrender} data-off="1">
+              <button className="abtn abtn-surrender" onClick={doSurrender} {...(!canSurrender ? { 'data-off': '1' } : {})}>
                 <div className="abtn-icon">⚑</div><div className="abtn-label">Surrender</div>
               </button>
             </div>
@@ -479,28 +537,24 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
               ヒント
             </div>
           </div>
-
           <div className={`hint-wrap${hintOn ? '' : ' hidden'}`}>
             <div className="hint-inner">
               <div className="hint-star">★</div>
               <div className="hint-text" dangerouslySetInnerHTML={{ __html: hintText }} />
             </div>
           </div>
-
           {resultSummary && (
-            <div className={`result-summary ${resultSummary.cls}`} style={{ display: 'block' }}>
-              {resultSummary.msg}
-            </div>
+            <div className={`result-summary ${resultSummary.cls}`} style={{ display: 'block' }}>{resultSummary.msg}</div>
           )}
-
           <div className="points-row">
             <div><div className="points-label">Points</div><div className="points-val">{points.toLocaleString()}</div></div>
             <div style={{ textAlign: 'right' }}><div className="points-label">Bet</div><div className="bet-val">{extraMode && extraBet > 0 ? `${bet}+${extraBet} pt` : `${bet} pt`}</div></div>
           </div>
-
           <div className="chip-row">
             {[5, 10, 25, 50, 100].map(v => (
-              <div key={v} id={`chip-${v}`} className={`chip chip-${v}`} onClick={() => chipClick(v)}>{v}</div>
+              <div key={v} className={`chip chip-${v}${(!isBetting && !extraMode) ? ' disabled' : ''}`}
+                style={(!isBetting && !extraMode) ? { opacity: 0.28, pointerEvents: 'none' } : {}}
+                onClick={() => chipClick(v)}>{v}</div>
             ))}
             <div className="chip chip-clear" onClick={clearChip}>CLEAR</div>
           </div>
@@ -512,7 +566,19 @@ export default function GameScreen({ room, player, initialDeck, initialDealerHan
         <div className="ranking-header">Players</div>
         {Array(3).fill(null).map((_, i) => {
           const other = otherPlayers[i]
-          if (other) return <OtherPlayer key={other.id} player={other} maxPoints={maxPoints} showCards={showCards} />
+          if (other) {
+            const isCurrentTurn = other.play_order === currentPlayerOrder
+            return (
+              <div key={other.id} style={{ position: 'relative' }}>
+                {isCurrentTurn && (
+                  <div style={{ position: 'absolute', top: 4, left: 4, zIndex: 10, fontSize: 9, background: 'rgba(46,204,113,0.4)', color: '#7dffb3', padding: '1px 6px', borderRadius: 8, fontFamily: 'sans-serif' }}>
+                    ターン中
+                  </div>
+                )}
+                <OtherPlayer player={other} maxPoints={maxPoints} showCards={isEnd || other.status === 'done'} />
+              </div>
+            )
+          }
           return <div key={i} className="empty-slot"><div className="empty-text">空席</div></div>
         })}
       </div>
