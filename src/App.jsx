@@ -20,7 +20,14 @@ export default function App() {
   }, [room, phase])
 
   function handleJoin({ room: r, player: p }) {
-    setRoom(r); setPlayer(p); setPhase('waiting')
+    setRoom(r)
+    setPlayer(p)
+    // ゲームがすでに進行中なら待機画面ではなくゲーム画面へ
+    if (['betting', 'dealing', 'playing', 'dealer', 'end'].includes(r.status)) {
+      setPhase('game')
+    } else {
+      setPhase('waiting')
+    }
   }
 
   function handleStart() { setPhase('game') }

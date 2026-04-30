@@ -21,6 +21,7 @@ export default function WaitingRoom({ room, player, onStart }) {
   }
 
   async function startGame() {
+    // 1人以上いればスタート可能
     const shuffled = [...players].sort(() => Math.random() - 0.5)
     for (let i = 0; i < shuffled.length; i++) {
       await supabase.from('bj_players').update({
@@ -41,7 +42,7 @@ export default function WaitingRoom({ room, player, onStart }) {
         <div className="room-code-label">ルームコード</div>
         <div className="room-code-value">{room.room_code}</div>
         <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)', fontFamily: 'sans-serif', marginTop: 4 }}>
-          友達にこのコードを共有してください
+          友達にこのコードを共有してください（途中参加もOK！）
         </div>
       </div>
       <div className="players-list">
@@ -56,14 +57,14 @@ export default function WaitingRoom({ room, player, onStart }) {
           ) : (
             <div key={i} className="player-row player-slot">
               <div className="player-dot" style={{ background: 'rgba(255,255,255,0.15)' }} />
-              <div className="player-name">待機中...</div>
+              <div className="player-name">空席</div>
             </div>
           )
         ))}
       </div>
       {player.is_host ? (
-        <button className="lobby-btn btn-create" style={{ width: 280 }} onClick={startGame} disabled={players.length < 1}>
-          {players.length < 2 ? `あと${2 - players.length}人待機中...` : `✦ ゲームスタート（${players.length}人）`}
+        <button className="lobby-btn btn-create" style={{ width: 280 }} onClick={startGame}>
+          ✦ ゲームスタート（{players.length}人）
         </button>
       ) : (
         <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.4)', fontFamily: 'sans-serif' }}>
