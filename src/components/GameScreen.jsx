@@ -258,18 +258,43 @@ export default function GameScreen({ room, player }) {
   function getHint(hand) {
     const h = hand || playerHand
     const pv = handValue(h)
-    if (pv === 21 && h.length === 2) return '<span class="tag">Blackjack</span>最初の2枚で21！<strong>ブラックジャック</strong>です🎉'
-    if (pv > 21) return '<span class="tag">Bust</span>合計が<strong>21を超えた</strong>のでバースト。'
+    const soft = isSoft(h)
     const canDouble = firstTurn && h.length === 2
     const canSplit = firstTurn && h.length === 2 && h[0] && h[1] && cardVal(h[0].r) === cardVal(h[1].r)
-    const msgs = []
-    if (canSplit) msgs.push('<span class="tag">Split</span>同じ数字2枚！2つの手に分けて戦えます。')
-    if (canDouble) msgs.push('<span class="tag">Double</span>最初の2枚限定。追加チップを置いて1枚引きます。')
-    if (firstTurn && h.length === 2) msgs.push('<span class="tag">Surrender</span>勝ち目が薄いと思ったら降参できます。半額返還。')
-    if (msgs.length > 0) return msgs[0]
-    if (pv <= 11) return `合計<strong>${pv}</strong>。<strong>Hit</strong>でカードを追加できます。`
-    if (pv >= 17) return `合計<strong>${pv}</strong>。<strong>Stay</strong>でこのままディーラーと勝負。`
-    return `合計<strong>${pv}</strong>。<strong>Hit</strong>でもう1枚、<strong>Stay</strong>で勝負。`
+    const canSurrender = firstTurn && h.length === 2
+
+    if (pv === 21 && h.length === 2) return '🎉 <strong>ブラックジャック！</strong> 最初の2枚でぴったり21です！通常より多くのポイントがもらえますよ。おめでとうございます！'
+    if (pv > 21) return `😢 合計が<strong>${pv}</strong>になり、21を超えてしまいました。これを「バースト」といいます。バーストすると自動的に負けになりますので、次のラウンドでまたチャレンジしてみましょう！`
+    if (pv === 21) return `✨ 合計がぴったり<strong>21</strong>です！<strong>Stay</strong>を押して、ディーラーと勝負しましょう！`
+
+    if (canSplit) {
+      const rankName = h[0].r === 'A' ? 'エース' : h[0].r
+      return `💡 <span class="tag">Split（分ける）</span>同じ数字「<strong>${rankName}</strong>」が2枚あります！<strong>Split</strong>を使うと2つの手に分けてそれぞれ戦えます。勝てるチャンスが2倍になりますよ。`
+    }
+
+    if (soft) {
+      if (pv >= 19) return `👍 Aを含む<strong>ソフト${pv}</strong>です。Aは「1」か「11」のどちらにも使えるので、とても有利な手です。<strong>Stay</strong>して勝負するのがオススメです！`
+      if (pv === 18) return `🃏 Aを含む<strong>ソフト18</strong>です。次に大きい数字が来てもAが「1」に変わるので、バーストの心配が少ないですよ。<strong>Hit</strong>か<strong>Stay</strong>お好みで！`
+      return `🃏 Aを含む<strong>ソフト${pv}</strong>です。Aは「1」か「11」どちらにも使える特別なカードです。バーストしにくいので<strong>Hit</strong>しやすい状況ですよ！`
+    }
+
+    if (canDouble && (pv === 10 || pv === 11)) return `💰 <span class="tag">Double（2倍）</span>合計<strong>${pv}</strong>はダブルダウンのチャンスです！ベットを2倍にして1枚だけ引きます。10や11は次に大きい数字が来やすいので狙い目ですよ！`
+
+    if (pv <= 11) return `😊 合計<strong>${pv}</strong>です。まだ21まで余裕があり、どんなカードが来てもバーストしません。<strong>Hit</strong>でどんどんカードを引いていきましょう！`
+
+    if (pv === 12) return `🤔 合計<strong>12</strong>です。実はトランプ52枚のうち16枚（10・J・Q・K）が10点で、約30%が10点カードです。次に10点が来るとバーストしてしまいますので、ディーラーの見えているカードと相談しながら<strong>Hit</strong>か<strong>Stay</strong>を選んでみてください。`
+
+    if (pv >= 13 && pv <= 15) return `😬 合計<strong>${pv}</strong>です。トランプの約30%は10点カード（10・J・Q・K）なので、Hitするとバーストしやすくなっています。ディーラーの見えているカードが7以上なら<strong>Hit</strong>、6以下なら<strong>Stay</strong>してディーラーのバーストを待つのも作戦です！${canSurrender ? ' 自信がなければ<strong>Surrender</strong>でベットの半額を取り返すこともできます。' : ''}`
+
+    if (pv === 16) return `😰 合計<strong>16</strong>は最も判断が難しい数字です。トランプの約30%は10点カードなので、Hitするとバーストのリスクがあります。<strong>Stay</strong>してディーラーのバーストを待つか、${canSurrender ? '<strong>Surrender</strong>でベットの半額を取り返して次のラウンドに備えるのも賢い選択ですよ！' : 'ディーラーの見えているカードを参考に判断してみてください！'}`
+
+    if (pv === 17) return `🙂 合計<strong>17</strong>です。ディーラーは<strong>17以上になるまで必ずカードを引くルール</strong>があります。<strong>Stay</strong>してディーラーのバーストを待つのがオススメですよ！`
+
+    if (pv === 18) return `👍 合計<strong>18</strong>です。かなり良い手です！これ以上引くとバーストのリスクが高くなりますので、<strong>Stay</strong>してこのままディーラーと勝負するのがオススメです。`
+
+    if (pv >= 19) return `🌟 合計<strong>${pv}</strong>です。とても良い手ですよ！<strong>Stay</strong>を押して、自信を持ってディーラーと勝負しましょう！`
+
+    return `合計<strong>${pv}</strong>です。<strong>Hit</strong>でもう1枚引くか、<strong>Stay</strong>でこのまま勝負するか選んでください。21を超えるとバーストで負けになりますのでご注意を！`
   }
 
   async function confirmBet() {
